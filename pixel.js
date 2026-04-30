@@ -26,7 +26,7 @@
         return;
     }
 
-    const ENDPOINT_URL = 'https://api.ingaze.com/events';
+    const ENDPOINT_URL = 'https://ingaze-tracking-worker.guglielmo-84a.workers.dev/';
 
     // Lista degli ATS noti (aggiunto il customAtsDomain se presente)
     const atsDomains = [

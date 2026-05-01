@@ -306,61 +306,76 @@
     }
 
     /**
-     * SPA Navigation Monitoring
-     * Intercetta history.pushState/replaceState per rilevare navigazioni
-     * interne in framework SPA (Bubble.io, React, Vue, ecc.)
-     * dove i bottoni non hanno href e la navigazione è gestita via JS.
+     * Navigation Interception (Navigation API)
+     * Intercetta TUTTE le navigazioni (incluso window.location.href = ...)
+     * PRIMA che avvengano. Disponibile in Chrome/Edge 102+.
+     * Usa sendBeacon con text/plain per inviare l'evento prima che la pagina muoia.
      */
-    function setupSpaMonitoring() {
-        var lastUrl = window.location.href;
+    function setupNavigationInterception() {
+        if (!window.navigation) return;
 
-        function onUrlChange() {
-            var currentUrl = window.location.href;
-            if (currentUrl === lastUrl) return;
+        navigation.addEventListener('navigate', function (event) {
+            var destinationUrl = event.destination.url;
+            if (!destinationUrl) return;
 
-            var newPageType = getPageType(currentUrl);
+            var eventType = null;
 
-            // Se siamo arrivati su una pagina job_detail, traccia job_click
-            if (newPageType === 'job_detail') {
-                // Evita duplicati se il click handler lo ha già tracciato
-                if (currentUrl !== lastJobClickUrl || Date.now() - lastJobClickTime > 2000) {
-                    lastJobClickUrl = currentUrl;
+            // Controllo outbound ATS
+            if (isAtsLink(destinationUrl)) {
+                eventType = 'outbound_ats_click';
+            }
+            // Controllo navigazione verso job_detail
+            else if (getPageType(destinationUrl) === 'job_detail') {
+                // Evita duplicati
+                if (destinationUrl !== lastJobClickUrl || Date.now() - lastJobClickTime > 2000) {
+                    lastJobClickUrl = destinationUrl;
                     lastJobClickTime = Date.now();
-                    sendEvent('job_click', currentUrl);
+                    eventType = 'job_click';
                 }
             }
 
-            lastUrl = currentUrl;
-        }
+            if (!eventType) return;
 
-        // Intercetta history.pushState (usato da tutti i framework SPA)
-        var originalPushState = history.pushState;
-        history.pushState = function () {
-            originalPushState.apply(this, arguments);
-            onUrlChange();
-        };
+            var payload = {
+                Timestamp: new Date().toISOString(),
+                Workspace_ID: workspaceId,
+                Session_ID: getSessionId(),
+                Event_Type: eventType,
+                Page_URL: destinationUrl,
+                UTM_Source: getUtmSource(),
+                Page_Type: getPageType(destinationUrl),
+                Job_ID: getJobId(destinationUrl)
+            };
 
-        // Intercetta history.replaceState
-        var originalReplaceState = history.replaceState;
-        history.replaceState = function () {
-            originalReplaceState.apply(this, arguments);
-            onUrlChange();
-        };
-
-        // Rileva navigazioni back/forward
-        window.addEventListener('popstate', onUrlChange);
+            // sendBeacon con text/plain bypassa il CORS preflight.
+            // Il Worker già gestisce payload text/plain (request.text() + JSON.parse).
+            var blob = new Blob([JSON.stringify(payload)], { type: 'text/plain' });
+            navigator.sendBeacon(ENDPOINT_URL, blob);
+        });
     }
 
     /**
-     * Outbound Interception
-     * Intercetta window.open() per rilevare quando un framework JS
-     * (es. Bubble.io) apre un link esterno verso un ATS.
+     * Outbound Interception (Fallback)
+     * Per browser senza Navigation API: intercetta window.open()
+     * e prova a wrappare location.assign/replace.
      */
-    function setupOutboundInterception() {
+    function setupOutboundFallback() {
+        // Intercetta window.open (per link che aprono in nuova tab)
         var originalOpen = window.open;
         window.open = function (url) {
             if (url && isAtsLink(url.toString())) {
-                sendEvent('outbound_ats_click', url.toString());
+                var payload = {
+                    Timestamp: new Date().toISOString(),
+                    Workspace_ID: workspaceId,
+                    Session_ID: getSessionId(),
+                    Event_Type: 'outbound_ats_click',
+                    Page_URL: url.toString(),
+                    UTM_Source: getUtmSource(),
+                    Page_Type: getPageType(),
+                    Job_ID: getJobId()
+                };
+                var blob = new Blob([JSON.stringify(payload)], { type: 'text/plain' });
+                navigator.sendBeacon(ENDPOINT_URL, blob);
             }
             return originalOpen.apply(this, arguments);
         };
@@ -372,17 +387,31 @@
     function init() {
         parseUtms();
 
+        // Retrospective job_click detection:
+        // Se il pixel si carica su una pagina job_detail e il referrer
+        // è dello stesso sito, significa che l'utente ha cliccato su un'offerta.
+        // Questo funziona universalmente indipendentemente dal framework.
+        var currentPageType = getPageType();
+        if (currentPageType === 'job_detail') {
+            try {
+                var referrer = document.referrer;
+                if (referrer && new URL(referrer).origin === window.location.origin) {
+                    sendEvent('job_click');
+                }
+            } catch (e) { }
+        }
+
         // Traccia la page_view al caricamento
         sendEvent('page_view');
 
-        // Imposta l'ascolto dei click (per siti tradizionali con <a> tags)
+        // Layer 1: Click handler con preventDefault (per siti con <a> tags)
         setupEventDelegation();
 
-        // Imposta il monitoraggio SPA (per framework come Bubble.io)
-        setupSpaMonitoring();
+        // Layer 2: Navigation API (per Bubble.io e framework con location.href)
+        setupNavigationInterception();
 
-        // Intercetta window.open per outbound ATS
-        setupOutboundInterception();
+        // Layer 3: Fallback window.open per browser senza Navigation API
+        setupOutboundFallback();
     }
 
     // Esegui quando il DOM è pronto

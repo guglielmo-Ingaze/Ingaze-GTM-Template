@@ -83,13 +83,24 @@
      * Page Context Extractors
      */
     function extractJobId(url, base) {
-        if (!base) return null;
+        if (!base || !url) return null;
+        base = base.trim();
+        url = url.trim();
+        
+        // Normalizziamo le stringhe per il confronto base
         const urlLower = url.toLowerCase();
-        const baseLower = base.toLowerCase();
+        let baseLower = base.toLowerCase();
+        
+        // Rimuoviamo eventuale slash finale dalla base (a meno che non finisca con =) per evitare mismatch
+        if (!baseLower.endsWith('=')) {
+            baseLower = baseLower.replace(/\/+$/, '');
+        }
+
         const idx = urlLower.indexOf(baseLower);
         if (idx === -1) return null;
 
-        let remainder = url.substring(idx + base.length);
+        // Estraiamo la parte dell'URL che viene DOPO la base
+        let remainder = url.substring(idx + baseLower.length);
 
         // Se la base terminava esplicitamente con "=", è un parametro esatto (es. ?job=)
         if (baseLower.endsWith('=')) {
@@ -98,12 +109,14 @@
             return id || null;
         }
 
+        // Rimuoviamo eventuali slash all'inizio del remainder
         remainder = remainder.replace(/^\/+/, '');
 
         // Se inizia con "?", significa che l'ID è passato come query parameter
         if (remainder.startsWith('?')) {
             try {
-                const params = new URLSearchParams(remainder.split('#')[0]);
+                const searchStr = remainder.split('#')[0];
+                const params = new URLSearchParams(searchStr);
 
                 // Cerchiamo chiavi comuni usate per gli ID delle offerte
                 const jobKeys = ['job', 'id', 'offerta', 'position', 'slug', 'req', 'role', 'guid'];
@@ -136,7 +149,8 @@
     }
 
     function getPageType() {
-        const currentUrlFull = window.location.href.toLowerCase();
+        const currentUrlFull = window.location.href;
+        const currentUrlLower = currentUrlFull.toLowerCase();
 
         // 1. Identifica 'job_detail' usando jobOfferUrl
         if (jobOfferUrl && extractJobId(currentUrlFull, jobOfferUrl) !== null) {
@@ -145,10 +159,10 @@
 
         // 2. Identifica 'career_home' usando careerSiteUrl
         // Rimuoviamo query e hash per fare il check pulito della root
-        const currentBase = currentUrlFull.split('?')[0].split('#')[0].replace(/\/$/, '');
+        const currentBase = currentUrlLower.split('?')[0].split('#')[0].replace(/\/$/, '');
 
         if (careerSiteUrl) {
-            const baseCareer = careerSiteUrl.toLowerCase().split('?')[0].split('#')[0].replace(/\/$/, '');
+            const baseCareer = careerSiteUrl.toLowerCase().trim().split('?')[0].split('#')[0].replace(/\/$/, '');
             if (currentBase === baseCareer) {
                 return 'career_home';
             }

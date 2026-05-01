@@ -86,11 +86,11 @@
         if (!base || !url) return null;
         base = base.trim();
         url = url.trim();
-        
+
         // Normalizziamo le stringhe per il confronto base
         const urlLower = url.toLowerCase();
         let baseLower = base.toLowerCase();
-        
+
         // Rimuoviamo eventuale slash finale dalla base (a meno che non finisca con =) per evitare mismatch
         if (!baseLower.endsWith('=')) {
             baseLower = baseLower.replace(/\/+$/, '');
@@ -234,38 +234,116 @@
     }
 
     /**
+     * Coda di eventi per navigazioni interne
+     */
+    function enqueueEvent(eventType) {
+        const payload = {
+            Timestamp: new Date().toISOString(),
+            Workspace_ID: workspaceId,
+            Session_ID: getSessionId(),
+            Event_Type: eventType,
+            Page_URL: window.location.href, // Salviamo l'URL di origine
+            UTM_Source: getUtmSource(),
+            Page_Type: getPageType(),
+            Job_ID: getJobId()
+        };
+
+        let queue = [];
+        try {
+            const stored = sessionStorage.getItem('ingaze_event_queue');
+            if (stored) queue = JSON.parse(stored);
+        } catch (e) { }
+
+        queue.push(payload);
+        sessionStorage.setItem('ingaze_event_queue', JSON.stringify(queue));
+    }
+
+    function processEventQueue() {
+        try {
+            const stored = sessionStorage.getItem('ingaze_event_queue');
+            if (!stored) return;
+
+            const queue = JSON.parse(stored);
+            if (!Array.isArray(queue) || queue.length === 0) return;
+
+            // Invia tutti gli eventi in sospeso
+            queue.forEach(payload => {
+                fetch(ENDPOINT_URL, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload),
+                    keepalive: true
+                }).catch(err => console.warn('[Ingaze] Errore invio coda:', err));
+            });
+
+            // Svuota la coda dopo l'invio
+            sessionStorage.removeItem('ingaze_event_queue');
+        } catch (e) {
+            console.warn('[Ingaze] Errore processamento coda:', e);
+        }
+    }
+
+    /**
+     * Invia evento istantaneo senza bloccare l'unload (perfetto per outbound)
+     */
+    function sendBeaconEvent(eventType) {
+        const payload = {
+            Timestamp: new Date().toISOString(),
+            Workspace_ID: workspaceId,
+            Session_ID: getSessionId(),
+            Event_Type: eventType,
+            Page_URL: window.location.href,
+            UTM_Source: getUtmSource(),
+            Page_Type: getPageType(),
+            Job_ID: getJobId()
+        };
+
+        // Wrap the payload in a text/plain Blob to bypass CORS preflight restrictions
+        // that normally block application/json in sendBeacon.
+        if (navigator.sendBeacon) {
+            const blob = new Blob([JSON.stringify(payload)], { type: 'text/plain' });
+            navigator.sendBeacon(ENDPOINT_URL, blob);
+        } else {
+            // Fallback for ancient browsers
+            sendEvent(eventType);
+        }
+    }
+
+    /**
      * Event Delegation
      */
     function setupEventDelegation() {
         document.addEventListener('click', function (e) {
-            // Trova l'elemento <a> o <button> più vicino al click
             const target = e.target.closest('a, button, input[type="button"], input[type="submit"]');
             if (!target) return;
 
-            // Usa target.href per i tag <a> per ottenere l'URL *assoluto* e non relativo.
-            // Se è un bottone che non ha href, ma contiene un <a>, cerca l'<a> all'interno.
             let url = target.href || target.getAttribute('href') || target.getAttribute('data-link');
             if (!url && target.tagName.toLowerCase() !== 'a') {
                 const innerA = target.querySelector('a');
                 if (innerA) url = innerA.href;
             }
 
-            // 1. Controllo Outbound ATS Click
+            // 1. Outbound ATS Click -> L'utente lascia il dominio. DEVE usare Beacon.
             if (isAtsLink(url)) {
-                sendEvent('outbound_ats_click');
+                sendBeaconEvent('outbound_ats_click');
                 return;
             }
 
-            // 2. Controllo Apply Click
+            // 2. Apply Click -> Dipende. Se è un link che apre nella stessa finestra, accoda.
+            // Altrimenti, sendEvent normale asincrono.
             if (isApplyButton(target)) {
-                sendEvent('apply_click');
+                if (target.tagName.toLowerCase() === 'a' && url && !target.getAttribute('target')) {
+                    enqueueEvent('apply_click');
+                } else {
+                    sendEvent('apply_click');
+                }
                 return;
             }
 
-            // 3. Controllo Job Click
+            // 3. Job Click -> Navigazione interna certa. Accoda l'evento.
             if (target.tagName.toLowerCase() === 'a' && isJobDetailLink(url, target)) {
-                sendEvent('job_click');
-                return;
+                enqueueEvent('job_click');
+                return; // Non blocchiamo nulla, il browser naviga all'istante.
             }
         });
     }

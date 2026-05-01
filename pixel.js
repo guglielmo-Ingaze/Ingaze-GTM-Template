@@ -91,18 +91,13 @@
             Page_URL: window.location.href,
             UTM_Source: getUtmSource()
         };
-
-        // Usa sendBeacon per i click (più affidabile quando si cambia pagina), altrimenti fetch
-        if (navigator.sendBeacon && eventType !== 'page_view') {
-            const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' });
-            navigator.sendBeacon(ENDPOINT_URL, blob);
-        } else {
-            fetch(ENDPOINT_URL, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payload)
-            }).catch(err => console.warn('[Ingaze] Errore invio evento:', err));
-        }
+    
+        fetch(ENDPOINT_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+            keepalive: true
+        }).catch(err => console.warn('[Ingaze] Errore invio evento:', err));
     }
 
     /**

@@ -144,12 +144,12 @@
         }
     }
 
-    function getJobId() {
-        return extractJobId(window.location.href, jobOfferUrl);
+    function getJobId(url = null) {
+        return extractJobId(url || window.location.href, jobOfferUrl);
     }
 
-    function getPageType() {
-        const currentUrlFull = window.location.href;
+    function getPageType(url = null) {
+        const currentUrlFull = url || window.location.href;
         const currentUrlLower = currentUrlFull.toLowerCase();
 
         // 1. Identifica 'job_detail' usando jobOfferUrl
@@ -236,16 +236,17 @@
     /**
      * Coda di eventi per navigazioni interne
      */
-    function enqueueEvent(eventType) {
+    function enqueueEvent(eventType, targetUrl = null) {
+        const urlToParse = targetUrl || window.location.href;
         const payload = {
             Timestamp: new Date().toISOString(),
             Workspace_ID: workspaceId,
             Session_ID: getSessionId(),
             Event_Type: eventType,
-            Page_URL: window.location.href, // Salviamo l'URL di origine
+            Page_URL: urlToParse, // Salviamo l'URL effettivo dell'evento
             UTM_Source: getUtmSource(),
-            Page_Type: getPageType(),
-            Job_ID: getJobId()
+            Page_Type: getPageType(urlToParse),
+            Job_ID: getJobId(urlToParse)
         };
 
         let queue = [];
@@ -286,16 +287,17 @@
     /**
      * Invia evento istantaneo senza bloccare l'unload (perfetto per outbound)
      */
-    function sendBeaconEvent(eventType) {
+    function sendBeaconEvent(eventType, targetUrl = null) {
+        const urlToParse = targetUrl || window.location.href;
         const payload = {
             Timestamp: new Date().toISOString(),
             Workspace_ID: workspaceId,
             Session_ID: getSessionId(),
             Event_Type: eventType,
-            Page_URL: window.location.href,
+            Page_URL: urlToParse,
             UTM_Source: getUtmSource(),
-            Page_Type: getPageType(),
-            Job_ID: getJobId()
+            Page_Type: getPageType(urlToParse),
+            Job_ID: getJobId(urlToParse)
         };
 
         // Wrap the payload in a text/plain Blob to bypass CORS preflight restrictions
@@ -325,7 +327,7 @@
 
             // 1. Outbound ATS Click -> L'utente lascia il dominio. DEVE usare Beacon.
             if (isAtsLink(url)) {
-                sendBeaconEvent('outbound_ats_click');
+                sendBeaconEvent('outbound_ats_click', url);
                 return;
             }
 
@@ -333,7 +335,7 @@
             // Altrimenti, sendEvent normale asincrono.
             if (isApplyButton(target)) {
                 if (target.tagName.toLowerCase() === 'a' && url && !target.getAttribute('target')) {
-                    enqueueEvent('apply_click');
+                    enqueueEvent('apply_click', url);
                 } else {
                     sendEvent('apply_click');
                 }
@@ -342,7 +344,7 @@
 
             // 3. Job Click -> Navigazione interna certa. Accoda l'evento.
             if (target.tagName.toLowerCase() === 'a' && isJobDetailLink(url, target)) {
-                enqueueEvent('job_click');
+                enqueueEvent('job_click', url);
                 return; // Non blocchiamo nulla, il browser naviga all'istante.
             }
         });

@@ -174,6 +174,9 @@
     /**
      * Core: Invia l'evento al Middleware (Cloudflare Worker)
      */
+    // Deduplicazione: evita doppio job_click da click handler + SPA monitor
+    var lastJobClickUrl = null;
+    var lastJobClickTime = 0;
     function sendEvent(eventType, contextUrl) {
         const url = contextUrl || window.location.href;
         const payload = {
@@ -283,6 +286,10 @@
 
                 // Invia l'evento con l'URL di destinazione come contesto,
                 // poi naviga (sia in caso di successo che di errore).
+                if (eventType === 'job_click') {
+                    lastJobClickUrl = url;
+                    lastJobClickTime = Date.now();
+                }
                 sendEvent(eventType, url)
                     .then(doNavigate)
                     .catch(doNavigate);
@@ -299,6 +306,67 @@
     }
 
     /**
+     * SPA Navigation Monitoring
+     * Intercetta history.pushState/replaceState per rilevare navigazioni
+     * interne in framework SPA (Bubble.io, React, Vue, ecc.)
+     * dove i bottoni non hanno href e la navigazione è gestita via JS.
+     */
+    function setupSpaMonitoring() {
+        var lastUrl = window.location.href;
+
+        function onUrlChange() {
+            var currentUrl = window.location.href;
+            if (currentUrl === lastUrl) return;
+
+            var newPageType = getPageType(currentUrl);
+
+            // Se siamo arrivati su una pagina job_detail, traccia job_click
+            if (newPageType === 'job_detail') {
+                // Evita duplicati se il click handler lo ha già tracciato
+                if (currentUrl !== lastJobClickUrl || Date.now() - lastJobClickTime > 2000) {
+                    lastJobClickUrl = currentUrl;
+                    lastJobClickTime = Date.now();
+                    sendEvent('job_click', currentUrl);
+                }
+            }
+
+            lastUrl = currentUrl;
+        }
+
+        // Intercetta history.pushState (usato da tutti i framework SPA)
+        var originalPushState = history.pushState;
+        history.pushState = function () {
+            originalPushState.apply(this, arguments);
+            onUrlChange();
+        };
+
+        // Intercetta history.replaceState
+        var originalReplaceState = history.replaceState;
+        history.replaceState = function () {
+            originalReplaceState.apply(this, arguments);
+            onUrlChange();
+        };
+
+        // Rileva navigazioni back/forward
+        window.addEventListener('popstate', onUrlChange);
+    }
+
+    /**
+     * Outbound Interception
+     * Intercetta window.open() per rilevare quando un framework JS
+     * (es. Bubble.io) apre un link esterno verso un ATS.
+     */
+    function setupOutboundInterception() {
+        var originalOpen = window.open;
+        window.open = function (url) {
+            if (url && isAtsLink(url.toString())) {
+                sendEvent('outbound_ats_click', url.toString());
+            }
+            return originalOpen.apply(this, arguments);
+        };
+    }
+
+    /**
      * Init logic
      */
     function init() {
@@ -307,8 +375,14 @@
         // Traccia la page_view al caricamento
         sendEvent('page_view');
 
-        // Imposta l'ascolto dei click
+        // Imposta l'ascolto dei click (per siti tradizionali con <a> tags)
         setupEventDelegation();
+
+        // Imposta il monitoraggio SPA (per framework come Bubble.io)
+        setupSpaMonitoring();
+
+        // Intercetta window.open per outbound ATS
+        setupOutboundInterception();
     }
 
     // Esegui quando il DOM è pronto

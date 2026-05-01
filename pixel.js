@@ -82,60 +82,65 @@
     /**
      * Page Context Extractors
      */
-    function getJobId() {
-        if (!jobOfferUrl) return null;
-
-        const currentUrlFull = window.location.href;
-        const currentUrlLower = currentUrlFull.toLowerCase();
-        const offerBaseLower = jobOfferUrl.toLowerCase();
-
-        if (currentUrlLower.includes(offerBaseLower)) {
-            // Estrai tutto ciò che viene dopo la stringa base dell'offerta
-            const startIndex = currentUrlLower.indexOf(offerBaseLower) + jobOfferUrl.length;
-            let remainder = currentUrlFull.substring(startIndex);
-
-            // Pulisci l'ID:
-            // 1. Se l'URL base termina con "=", l'ID è un parametro query (fermati a '&' o '#')
-            if (offerBaseLower.endsWith('=')) {
-                remainder = remainder.split('&')[0].split('#')[0];
-            } else {
-                // 2. Altrimenti è parte del path (fermati a '?' o '#')
-                remainder = remainder.split('?')[0].split('#')[0];
-            }
-
-            // Rimuovi eventuali slash iniziali e finali
-            remainder = remainder.replace(/^\/+|\/+$/g, '');
-
-            return remainder || null;
-        }
-
-        return null;
-    }
-
-    function hasJobSuffix(url) {
-        if (!jobOfferUrl) return false;
-        const base = jobOfferUrl.toLowerCase();
-        const idx = url.toLowerCase().indexOf(base);
-        if (idx === -1) return false;
+    function extractJobId(url, base) {
+        if (!base) return null;
+        const urlLower = url.toLowerCase();
+        const baseLower = base.toLowerCase();
+        const idx = urlLower.indexOf(baseLower);
+        if (idx === -1) return null;
 
         let remainder = url.substring(idx + base.length);
-        if (base.endsWith('=')) {
-            remainder = remainder.split('&')[0].split('#')[0];
-        } else {
-            remainder = remainder.split('?')[0].split('#')[0];
+
+        // Se la base terminava esplicitamente con "=", è un parametro esatto (es. ?job=)
+        if (baseLower.endsWith('=')) {
+            let id = remainder.split('&')[0].split('#')[0];
+            id = id.replace(/^\/+|\/+$/g, '');
+            return id || null;
         }
-        remainder = remainder.replace(/^\/+|\/+$/g, '');
-        return remainder.length > 0;
+
+        remainder = remainder.replace(/^\/+/, '');
+
+        // Se inizia con "?", significa che l'ID è passato come query parameter
+        if (remainder.startsWith('?')) {
+            try {
+                const params = new URLSearchParams(remainder.split('#')[0]);
+
+                // Cerchiamo chiavi comuni usate per gli ID delle offerte
+                const jobKeys = ['job', 'id', 'offerta', 'position', 'slug', 'req', 'role', 'guid'];
+                for (let key of jobKeys) {
+                    if (params.has(key) && params.get(key)) {
+                        return params.get(key);
+                    }
+                }
+
+                // Se c'è un solo parametro, e non è di paginazione, lo prendiamo per buono
+                const keys = Array.from(params.keys());
+                if (keys.length === 1) {
+                    const firstKey = keys[0];
+                    if (!['page', 'sort', 'filter', 'lang', 'utm_source'].includes(firstKey.toLowerCase())) {
+                        return params.get(firstKey);
+                    }
+                }
+            } catch (e) { }
+            return null;
+        } else {
+            // Altrimenti è parte del path (es. /software-engineer)
+            let id = remainder.split('?')[0].split('#')[0];
+            id = id.replace(/\/+$/g, '');
+            return id || null;
+        }
+    }
+
+    function getJobId() {
+        return extractJobId(window.location.href, jobOfferUrl);
     }
 
     function getPageType() {
         const currentUrlFull = window.location.href.toLowerCase();
 
         // 1. Identifica 'job_detail' usando jobOfferUrl
-        if (jobOfferUrl) {
-            if (hasJobSuffix(currentUrlFull)) {
-                return 'job_detail';
-            }
+        if (jobOfferUrl && extractJobId(currentUrlFull, jobOfferUrl) !== null) {
+            return 'job_detail';
         }
 
         // 2. Identifica 'career_home' usando careerSiteUrl
@@ -199,17 +204,16 @@
     function isJobDetailLink(url, element) {
         if (!url) return false;
 
-        const urlLower = url.toLowerCase();
-
-        // Se abbiamo jobOfferUrl, usalo come euristica primaria forte
-        if (jobOfferUrl && urlLower.includes(jobOfferUrl.toLowerCase())) {
+        // 1. Euristica forte basata sulla GTM config
+        if (jobOfferUrl && extractJobId(url, jobOfferUrl) !== null) {
             return true;
         }
 
-        const text = (element.innerText || '').toLowerCase();
-
-        // Euristiche base per identificare link a dettagli offerte
+        // 2. Fallback su keyword nel path e nel testo
+        const urlLower = url.toLowerCase();
         const hasJobPath = urlLower.includes('/job/') || urlLower.includes('/offerta/') || urlLower.includes('/career/') || urlLower.includes('/position/');
+
+        const text = (element.innerText || '').toLowerCase();
         const isJobRelatedText = text.includes('scopri') || text.includes('dettagli') || text.includes('view') || text.includes('details');
 
         return hasJobPath || isJobRelatedText;

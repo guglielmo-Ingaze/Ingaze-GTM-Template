@@ -86,11 +86,11 @@
         if (!base || !url) return null;
         base = base.trim();
         url = url.trim();
-
+        
         // Normalizziamo le stringhe per il confronto base
         const urlLower = url.toLowerCase();
         let baseLower = base.toLowerCase();
-
+        
         // Rimuoviamo eventuale slash finale dalla base (a meno che non finisca con =) per evitare mismatch
         if (!baseLower.endsWith('=')) {
             baseLower = baseLower.replace(/\/+$/, '');
@@ -144,12 +144,12 @@
         }
     }
 
-    function getJobId(url = null) {
-        return extractJobId(url || window.location.href, jobOfferUrl);
+    function getJobId() {
+        return extractJobId(window.location.href, jobOfferUrl);
     }
 
-    function getPageType(url = null) {
-        const currentUrlFull = url || window.location.href;
+    function getPageType() {
+        const currentUrlFull = window.location.href;
         const currentUrlLower = currentUrlFull.toLowerCase();
 
         // 1. Identifica 'job_detail' usando jobOfferUrl
@@ -234,118 +234,38 @@
     }
 
     /**
-     * Coda di eventi per navigazioni interne
-     */
-    function enqueueEvent(eventType, targetUrl = null) {
-        const urlToParse = targetUrl || window.location.href;
-        const payload = {
-            Timestamp: new Date().toISOString(),
-            Workspace_ID: workspaceId,
-            Session_ID: getSessionId(),
-            Event_Type: eventType,
-            Page_URL: urlToParse, // Salviamo l'URL effettivo dell'evento
-            UTM_Source: getUtmSource(),
-            Page_Type: getPageType(urlToParse),
-            Job_ID: getJobId(urlToParse)
-        };
-
-        let queue = [];
-        try {
-            const stored = sessionStorage.getItem('ingaze_event_queue');
-            if (stored) queue = JSON.parse(stored);
-        } catch (e) { }
-
-        queue.push(payload);
-        sessionStorage.setItem('ingaze_event_queue', JSON.stringify(queue));
-    }
-
-    function processEventQueue() {
-        try {
-            const stored = sessionStorage.getItem('ingaze_event_queue');
-            if (!stored) return;
-
-            const queue = JSON.parse(stored);
-            if (!Array.isArray(queue) || queue.length === 0) return;
-
-            // Invia tutti gli eventi in sospeso
-            queue.forEach(payload => {
-                fetch(ENDPOINT_URL, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(payload),
-                    keepalive: true
-                }).catch(err => console.warn('[Ingaze] Errore invio coda:', err));
-            });
-
-            // Svuota la coda dopo l'invio
-            sessionStorage.removeItem('ingaze_event_queue');
-        } catch (e) {
-            console.warn('[Ingaze] Errore processamento coda:', e);
-        }
-    }
-
-    /**
-     * Invia evento istantaneo senza bloccare l'unload (perfetto per outbound)
-     */
-    function sendBeaconEvent(eventType, targetUrl = null) {
-        const urlToParse = targetUrl || window.location.href;
-        const payload = {
-            Timestamp: new Date().toISOString(),
-            Workspace_ID: workspaceId,
-            Session_ID: getSessionId(),
-            Event_Type: eventType,
-            Page_URL: urlToParse,
-            UTM_Source: getUtmSource(),
-            Page_Type: getPageType(urlToParse),
-            Job_ID: getJobId(urlToParse)
-        };
-
-        // Wrap the payload in a text/plain Blob to bypass CORS preflight restrictions
-        // that normally block application/json in sendBeacon.
-        if (navigator.sendBeacon) {
-            const blob = new Blob([JSON.stringify(payload)], { type: 'text/plain' });
-            navigator.sendBeacon(ENDPOINT_URL, blob);
-        } else {
-            // Fallback for ancient browsers
-            sendEvent(eventType);
-        }
-    }
-
-    /**
      * Event Delegation
      */
     function setupEventDelegation() {
         document.addEventListener('click', function (e) {
+            // Trova l'elemento <a> o <button> più vicino al click
             const target = e.target.closest('a, button, input[type="button"], input[type="submit"]');
             if (!target) return;
 
+            // Usa target.href per i tag <a> per ottenere l'URL *assoluto* e non relativo.
+            // Se è un bottone che non ha href, ma contiene un <a>, cerca l'<a> all'interno.
             let url = target.href || target.getAttribute('href') || target.getAttribute('data-link');
             if (!url && target.tagName.toLowerCase() !== 'a') {
                 const innerA = target.querySelector('a');
                 if (innerA) url = innerA.href;
             }
 
-            // 1. Outbound ATS Click -> L'utente lascia il dominio. DEVE usare Beacon.
+            // 1. Controllo Outbound ATS Click
             if (isAtsLink(url)) {
-                sendBeaconEvent('outbound_ats_click', url);
+                sendEvent('outbound_ats_click');
                 return;
             }
 
-            // 2. Apply Click -> Dipende. Se è un link che apre nella stessa finestra, accoda.
-            // Altrimenti, sendEvent normale asincrono.
+            // 2. Controllo Apply Click
             if (isApplyButton(target)) {
-                if (target.tagName.toLowerCase() === 'a' && url && !target.getAttribute('target')) {
-                    enqueueEvent('apply_click', url);
-                } else {
-                    sendEvent('apply_click');
-                }
+                sendEvent('apply_click');
                 return;
             }
 
-            // 3. Job Click -> Navigazione interna certa. Accoda l'evento.
+            // 3. Controllo Job Click
             if (target.tagName.toLowerCase() === 'a' && isJobDetailLink(url, target)) {
-                enqueueEvent('job_click', url);
-                return; // Non blocchiamo nulla, il browser naviga all'istante.
+                sendEvent('job_click');
+                return;
             }
         });
     }

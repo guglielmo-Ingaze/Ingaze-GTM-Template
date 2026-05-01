@@ -86,11 +86,11 @@
         if (!base || !url) return null;
         base = base.trim();
         url = url.trim();
-        
+
         // Normalizziamo le stringhe per il confronto base
         const urlLower = url.toLowerCase();
         let baseLower = base.toLowerCase();
-        
+
         // Rimuoviamo eventuale slash finale dalla base (a meno che non finisca con =) per evitare mismatch
         if (!baseLower.endsWith('=')) {
             baseLower = baseLower.replace(/\/+$/, '');
@@ -144,12 +144,12 @@
         }
     }
 
-    function getJobId() {
-        return extractJobId(window.location.href, jobOfferUrl);
+    function getJobId(url) {
+        return extractJobId(url || window.location.href, jobOfferUrl);
     }
 
-    function getPageType() {
-        const currentUrlFull = window.location.href;
+    function getPageType(url) {
+        const currentUrlFull = url || window.location.href;
         const currentUrlLower = currentUrlFull.toLowerCase();
 
         // 1. Identifica 'job_detail' usando jobOfferUrl
@@ -174,25 +174,23 @@
     /**
      * Core: Invia l'evento al Middleware (Cloudflare Worker)
      */
-    function sendEvent(eventType) {
+    function sendEvent(eventType, contextUrl) {
+        const url = contextUrl || window.location.href;
         const payload = {
             Timestamp: new Date().toISOString(),
             Workspace_ID: workspaceId,
             Session_ID: getSessionId(),
             Event_Type: eventType,
-            Page_URL: window.location.href,
+            Page_URL: url,
             UTM_Source: getUtmSource(),
-            Page_Type: getPageType(),
-            Job_ID: getJobId()
+            Page_Type: getPageType(url),
+            Job_ID: getJobId(url)
         };
 
-        // Il fetch con keepalive: true è lo standard moderno e non soffre
-        // dei problemi di CORS/Preflight che sendBeacon ha con i payload JSON.
-        fetch(ENDPOINT_URL, {
+        return fetch(ENDPOINT_URL, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload),
-            keepalive: true
+            body: JSON.stringify(payload)
         }).catch(err => console.warn('[Ingaze] Errore invio evento:', err));
     }
 
@@ -243,29 +241,59 @@
             if (!target) return;
 
             // Usa target.href per i tag <a> per ottenere l'URL *assoluto* e non relativo.
-            // Se è un bottone che non ha href, ma contiene un <a>, cerca l'<a> all'interno.
             let url = target.href || target.getAttribute('href') || target.getAttribute('data-link');
             if (!url && target.tagName.toLowerCase() !== 'a') {
                 const innerA = target.querySelector('a');
                 if (innerA) url = innerA.href;
             }
 
-            // 1. Controllo Outbound ATS Click
+            // Determina il tipo di evento e se causa navigazione
+            let eventType = null;
+            let navigatesAway = false;
+
             if (isAtsLink(url)) {
-                sendEvent('outbound_ats_click');
-                return;
+                eventType = 'outbound_ats_click';
+                navigatesAway = true;
+            } else if (isApplyButton(target)) {
+                eventType = 'apply_click';
+            } else if (target.tagName.toLowerCase() === 'a' && isJobDetailLink(url, target)) {
+                eventType = 'job_click';
+                navigatesAway = true;
             }
 
-            // 2. Controllo Apply Click
-            if (isApplyButton(target)) {
-                sendEvent('apply_click');
-                return;
-            }
+            if (!eventType) return;
 
-            // 3. Controllo Job Click
-            if (target.tagName.toLowerCase() === 'a' && isJobDetailLink(url, target)) {
-                sendEvent('job_click');
-                return;
+            // Per i click che causano navigazione (job_click, outbound_ats_click):
+            // Blocchiamo la navigazione del browser, inviamo l'evento di tracking,
+            // poi navighiamo programmaticamente. Questo è l'approccio standard
+            // usato da Google Analytics, Facebook Pixel, ecc.
+            // I link che aprono in nuova tab (_blank) non hanno questo problema
+            // perché la pagina corrente non viene scaricata.
+            const opensInNewTab = target.target === '_blank';
+
+            if (navigatesAway && url && !opensInNewTab) {
+                e.preventDefault();
+
+                let hasNavigated = false;
+                const doNavigate = function () {
+                    if (hasNavigated) return;
+                    hasNavigated = true;
+                    window.location.href = url;
+                };
+
+                // Invia l'evento con l'URL di destinazione come contesto,
+                // poi naviga (sia in caso di successo che di errore).
+                sendEvent(eventType, url)
+                    .then(doNavigate)
+                    .catch(doNavigate);
+
+                // Timeout di sicurezza: non bloccare mai la navigazione
+                // per più di 300ms, anche se l'endpoint è lento.
+                setTimeout(doNavigate, 300);
+            } else {
+                // Eventi che non causano navigazione (apply_click)
+                // o link che aprono in nuova tab: invio normale.
+                sendEvent(eventType, navigatesAway ? url : undefined);
             }
         });
     }

@@ -396,29 +396,79 @@
 
     /**
      * Outbound Interception (Fallback)
-     * Per browser senza Navigation API: intercetta window.open()
-     * e prova a wrappare location.assign/replace.
+     * Intercetta window.open() per link che non sono <a> tags.
      */
     function setupOutboundFallback() {
-        // Intercetta window.open (per link che aprono in nuova tab)
         var originalOpen = window.open;
         window.open = function (url) {
             if (url && isAtsLink(url.toString())) {
-                var payload = {
-                    Timestamp: new Date().toISOString(),
-                    Workspace_ID: workspaceId,
-                    Session_ID: getSessionId(),
-                    Event_Type: 'outbound_ats_click',
-                    Page_URL: url.toString(),
-                    UTM_Source: getUtmSource(),
-                    Page_Type: getPageType(),
-                    Job_ID: getJobId()
-                };
-                var blob = new Blob([JSON.stringify(payload)], { type: 'text/plain' });
-                navigator.sendBeacon(ENDPOINT_URL, blob);
+                sendEvent('outbound_ats_click', url.toString());
             }
             return originalOpen.apply(this, arguments);
         };
+    }
+
+    /**
+     * Outbound Links Rewrite (Redirect-based tracking)
+     */
+    const recentClicks = new Map();
+
+    function isDuplicateClick(url) {
+        const now = Date.now();
+        const last = recentClicks.get(url);
+        if (last && now - last < 1500) return true;
+        recentClicks.set(url, now);
+        return false;
+    }
+
+    function rewriteOutboundLinks() {
+        const links = document.querySelectorAll('a[href]');
+        
+        links.forEach(link => {
+            try {
+                const urlObj = new URL(link.href, window.location.origin);
+
+                if (!isAtsLink(urlObj.href)) return;
+
+                // Avoid double-wrapping
+                if (urlObj.pathname.startsWith('/out')) return;
+
+                const encoded = encodeURIComponent(urlObj.href);
+
+                const newUrl = `${ENDPOINT_URL.replace(/\/$/, '')}/out` +
+                    `?to=${encoded}` +
+                    `&wid=${workspaceId}` +
+                    `&sid=${getSessionId()}` +
+                    `&jid=${getJobId(urlObj.href) || ''}` +
+                    `&utm=${encodeURIComponent(getUtmSource() || '')}`;
+
+                link.href = newUrl;
+                link.rel = "noopener noreferrer";
+            } catch (e) {}
+        });
+    }
+
+    function setupOutboundRewriting() {
+        rewriteOutboundLinks();
+
+        const observer = new MutationObserver(() => {
+            rewriteOutboundLinks();
+        });
+
+        observer.observe(document.body, {
+            childList: true,
+            subtree: true
+        });
+
+        // Client-side dedupe for rewritten links
+        document.addEventListener('click', function(e) {
+            const target = e.target.closest('a');
+            if (target && target.href && target.href.includes('/out?to=')) {
+                if (isDuplicateClick(target.href)) {
+                    e.preventDefault();
+                }
+            }
+        }, true);
     }
 
     /**
@@ -455,6 +505,9 @@
 
         // Layer 3: Fallback window.open per browser outbound generici
         setupOutboundFallback();
+
+        // Layer 4: Redirect-based outbound tracking per <a> tags
+        setupOutboundRewriting();
     }
 
     // Esegui quando il DOM è pronto

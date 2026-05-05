@@ -1,5 +1,5 @@
 homepage: "https://www.ingaze.com"
 documentation: "https://github.com/ingaze/gtm-template/blob/main/README.md"
 versions:
-  - sha: 0000000000000000000000000000000000000000
+  - sha: a25c7e6c85419bea6d58109cd4aff8d4e5890802
     changeNotes: Initial release.

@@ -1,25 +1,28 @@
 /**
- * Ingaze Tracking Pixel
+ * Ingaze Tracking Pixel — v2
  * Injected via Google Tag Manager
- * 
- * Responsabilità:
- * 1. Generazione/Recupero Session ID.
- * 2. Estrazione e persistenza parametri UTM.
- * 3. Tracciamento page_view.
- * 4. Tracciamento click tramite Event Delegation (job_click, apply_click, outbound_ats_click).
- * 5. Invio dati strutturati al Cloudflare Worker.
+ *
+ * Key fixes vs v1:
+ * 1. SPA-aware routing: patches history.pushState/replaceState + popstate so
+ *    every client-side navigation is visible to the pixel.
+ * 2. Reliable outbound detection: cross-origin ATS links are tracked in the
+ *    click handler (page still alive) rather than via Navigation API (which
+ *    does NOT fire for cross-origin destinations in most browsers).
+ * 3. Belt-and-suspenders send: sendBeacon → keepalive fetch → sync XHR
+ *    fallback, in that priority order.
+ * 4. Queue is flushed on pagehide + visibilitychange so events survive
+ *    aggressive tab discard.
  */
 
 (function () {
-    // Evita esecuzioni multiple
     if (window.ingazePixelInitialized) return;
     window.ingazePixelInitialized = true;
 
-    // Recupera variabili esposte dal GTM Template
-    const workspaceId = window.ingazeWorkspaceId;
-    const customAtsDomain = window.ingazeAtsDomain || '';
-    const careerSiteUrl = window.ingazeCareerSiteUrl || '';
-    const jobOfferUrl = window.ingazeJobOfferUrl || '';
+    // ─── Config (injected by GTM template) ────────────────────────────────────
+    const workspaceId     = window.ingazeWorkspaceId;
+    const customAtsDomain = window.ingazeAtsDomain    || '';
+    const careerSiteUrl   = window.ingazeCareerSiteUrl || '';
+    const jobOfferUrl     = window.ingazeJobOfferUrl   || '';
 
     if (!workspaceId) {
         console.warn('[Ingaze] Workspace ID mancante. Tracking disabilitato.');
@@ -28,7 +31,6 @@
 
     const ENDPOINT_URL = 'https://ingaze-tracking-worker.guglielmo-84a.workers.dev/';
 
-    // Lista degli ATS noti (aggiunto il customAtsDomain se presente)
     const atsDomains = [
         'zucchetti', 'inrecruiting', 'allibo', 'personio',
         'workday', 'greenhouse', 'lever'
@@ -37,278 +39,226 @@
         atsDomains.push(customAtsDomain.replace(/^https?:\/\//, '').split('/')[0]);
     }
 
-    // Keyword per i pulsanti di "Apply"
     const applyKeywords = [
         'candidati', 'invia candidatura', 'invia cv', 'candidati ora', 'applica',
         'apply', 'apply now', 'submit application', 'submit resume', 'send application'
     ];
 
-    /**
-     * Utility: Genera un Session ID univoco
-     */
+    // ─── Session / UTM ────────────────────────────────────────────────────────
     function generateSessionId() {
         return 'sess_' + Math.random().toString(36).substring(2, 15) + Date.now().toString(36);
     }
 
-    /**
-     * Utility: Gestione Cookie e Storage
-     */
     function getSessionId() {
         let sid = sessionStorage.getItem('ingaze_session_id');
-        if (!sid) {
-            sid = generateSessionId();
-            sessionStorage.setItem('ingaze_session_id', sid);
-        }
+        if (!sid) { sid = generateSessionId(); sessionStorage.setItem('ingaze_session_id', sid); }
         return sid;
     }
 
     function parseUtms() {
-        const urlParams = new URLSearchParams(window.location.search);
-        const source = urlParams.get('utm_source');
-        const medium = urlParams.get('utm_medium');
-
-        if (source) {
-            sessionStorage.setItem('ingaze_utm_source', source);
-        }
-        if (medium) {
-            sessionStorage.setItem('ingaze_utm_medium', medium);
-        }
+        const p = new URLSearchParams(window.location.search);
+        if (p.get('utm_source')) sessionStorage.setItem('ingaze_utm_source', p.get('utm_source'));
+        if (p.get('utm_medium')) sessionStorage.setItem('ingaze_utm_medium', p.get('utm_medium'));
     }
 
-    function getUtmSource() {
-        return sessionStorage.getItem('ingaze_utm_source') || '';
-    }
+    function getUtmSource() { return sessionStorage.getItem('ingaze_utm_source') || ''; }
 
-    /**
-     * Page Context Extractors
-     */
+    // ─── URL / page-type helpers ──────────────────────────────────────────────
     function extractJobId(url, base) {
         if (!base || !url) return null;
-        base = base.trim();
-        url = url.trim();
-
-        // Normalizziamo le stringhe per il confronto base
+        base = base.trim(); url = url.trim();
         const urlLower = url.toLowerCase();
         let baseLower = base.toLowerCase();
-
-        // Rimuoviamo eventuale slash finale dalla base (a meno che non finisca con =) per evitare mismatch
-        if (!baseLower.endsWith('=')) {
-            baseLower = baseLower.replace(/\/+$/, '');
-        }
-
+        if (!baseLower.endsWith('=')) baseLower = baseLower.replace(/\/+$/, '');
         const idx = urlLower.indexOf(baseLower);
         if (idx === -1) return null;
-
-        // Estraiamo la parte dell'URL che viene DOPO la base
         let remainder = url.substring(idx + baseLower.length);
-
-        // Se la base terminava esplicitamente con "=", è un parametro esatto (es. ?job=)
         if (baseLower.endsWith('=')) {
-            let id = remainder.split('&')[0].split('#')[0];
-            id = id.replace(/^\/+|\/+$/g, '');
+            let id = remainder.split('&')[0].split('#')[0].replace(/^\/+|\/+$/g, '');
             return id || null;
         }
-
-        // Rimuoviamo eventuali slash all'inizio del remainder
         remainder = remainder.replace(/^\/+/, '');
-
-        // Se inizia con "?", significa che l'ID è passato come query parameter
         if (remainder.startsWith('?')) {
             try {
-                const searchStr = remainder.split('#')[0];
-                const params = new URLSearchParams(searchStr);
-
-                // Cerchiamo chiavi comuni usate per gli ID delle offerte
-                const jobKeys = ['job', 'id', 'offerta', 'position', 'slug', 'req', 'role', 'guid'];
-                for (let key of jobKeys) {
-                    if (params.has(key) && params.get(key)) {
-                        return params.get(key);
-                    }
+                const params = new URLSearchParams(remainder.split('#')[0]);
+                for (const key of ['job', 'id', 'offerta', 'position', 'slug', 'req', 'role', 'guid']) {
+                    if (params.has(key) && params.get(key)) return params.get(key);
                 }
-
-                // Se c'è un solo parametro, e non è di paginazione, lo prendiamo per buono
                 const keys = Array.from(params.keys());
-                if (keys.length === 1) {
-                    const firstKey = keys[0];
-                    if (!['page', 'sort', 'filter', 'lang', 'utm_source'].includes(firstKey.toLowerCase())) {
-                        return params.get(firstKey);
-                    }
+                if (keys.length === 1 && !['page','sort','filter','lang','utm_source'].includes(keys[0].toLowerCase())) {
+                    return params.get(keys[0]);
                 }
-            } catch (e) { }
+            } catch (e) {}
             return null;
-        } else {
-            // Altrimenti è parte del path (es. /software-engineer)
-            let id = remainder.split('?')[0].split('#')[0];
-            id = id.replace(/\/+$/g, '');
-            return id || null;
         }
+        let id = remainder.split('?')[0].split('#')[0].replace(/\/+$/g, '');
+        return id || null;
     }
 
-    function getJobId(url) {
-        return extractJobId(url || window.location.href, jobOfferUrl);
-    }
+    function getJobId(url) { return extractJobId(url || window.location.href, jobOfferUrl); }
 
     function getPageType(url) {
-        const currentUrlFull = url || window.location.href;
-        const currentUrlLower = currentUrlFull.toLowerCase();
-
-        // 1. Identifica 'job_detail' usando jobOfferUrl
-        if (jobOfferUrl && extractJobId(currentUrlFull, jobOfferUrl) !== null) {
-            return 'job_detail';
-        }
-
-        // 2. Identifica 'career_home' usando careerSiteUrl
-        // Rimuoviamo query e hash per fare il check pulito della root
-        const currentBase = currentUrlLower.split('?')[0].split('#')[0].replace(/\/$/, '');
-
+        const full  = url || window.location.href;
+        if (jobOfferUrl && extractJobId(full, jobOfferUrl) !== null) return 'job_detail';
+        const base  = full.toLowerCase().split('?')[0].split('#')[0].replace(/\/$/, '');
         if (careerSiteUrl) {
-            const baseCareer = careerSiteUrl.toLowerCase().trim().split('?')[0].split('#')[0].replace(/\/$/, '');
-            if (currentBase === baseCareer) {
-                return 'career_home';
-            }
+            const bc = careerSiteUrl.toLowerCase().trim().split('?')[0].split('#')[0].replace(/\/$/, '');
+            if (base === bc) return 'career_home';
         }
-
         return 'other';
     }
 
-    /**
-     * Core: Invia l'evento al Middleware (Cloudflare Worker)
-     */
-    // Deduplicazione: evita doppio job_click da click handler + SPA monitor
-    var lastJobClickUrl = null;
-    var lastJobClickTime = 0;
-
-    // Queue implementation per garantire l'invio durante la navigazione
+    // ─── Event queue (survives navigation) ───────────────────────────────────
     const QUEUE_KEY = 'ingaze_event_queue';
 
     function getQueue() {
-        try {
-            return JSON.parse(localStorage.getItem(QUEUE_KEY)) || [];
-        } catch (e) {
-            return [];
-        }
+        try { return JSON.parse(localStorage.getItem(QUEUE_KEY)) || []; } catch (e) { return []; }
     }
 
-    function saveQueue(queue) {
-        try {
-            localStorage.setItem(QUEUE_KEY, JSON.stringify(queue));
-        } catch (e) {}
+    function saveQueue(q) {
+        try { localStorage.setItem(QUEUE_KEY, JSON.stringify(q)); } catch (e) {}
     }
 
     function enqueueEvent(payload) {
         payload._eventId = Date.now().toString(36) + Math.random().toString(36).substr(2);
-        const queue = getQueue();
-        queue.push(payload);
-        saveQueue(queue);
+        const q = getQueue(); q.push(payload); saveQueue(q);
         return payload._eventId;
     }
 
     function dequeueEvent(eventId) {
-        const queue = getQueue();
-        const newQueue = queue.filter(item => item._eventId !== eventId);
-        saveQueue(newQueue);
+        saveQueue(getQueue().filter(item => item._eventId !== eventId));
     }
 
-    function sendEventPayload(payload) {
-        const eventId = payload._eventId;
-        const sendPayload = Object.assign({}, payload);
-        delete sendPayload._eventId;
-
-        return fetch(ENDPOINT_URL, {
-            method: 'POST',
-            headers: { 'Content-Type': 'text/plain' }, // Usa text/plain per evitare preflight CORS
-            body: JSON.stringify(sendPayload),
-            keepalive: true // Garantisce l'invio anche se la pagina viene chiusa/navigata
-        }).then(res => {
-            if (eventId) dequeueEvent(eventId);
-            return res;
-        }).catch(err => {
-            console.warn('[Ingaze] Errore invio evento:', err);
-        });
-    }
-
-    function flushQueue() {
-        const queue = getQueue();
-        queue.forEach(payload => {
-            sendEventPayload(payload);
-        });
-    }
-
-    function sendEvent(eventType, contextUrl) {
-        const url = contextUrl || window.location.href;
-        const payload = {
-            Timestamp: new Date().toISOString(),
-            Workspace_ID: workspaceId,
-            Session_ID: getSessionId(),
-            Event_Type: eventType,
-            Page_URL: url,
-            UTM_Source: getUtmSource(),
-            Page_Type: getPageType(url),
-            Job_ID: getJobId(url)
-        };
-
-        enqueueEvent(payload);
-        return sendEventPayload(payload);
-    }
-
+    // ─── Send helpers ─────────────────────────────────────────────────────────
     /**
-     * Heuristics per identificare i tipi di click
+     * sendReliable() — three-tier send:
+     * 1. navigator.sendBeacon  (best for pre-unload; fire-and-forget)
+     * 2. fetch with keepalive  (async, survives short navigation delays)
+     * 3. sync XMLHttpRequest   (last resort when the page is already dying;
+     *                           blocks the thread for <1 ms on LAN Worker)
+     *
+     * NOTE: sendBeacon is always attempted for critical pre-navigation events.
+     * fetch(keepalive) is used as the primary path for normal in-page events.
      */
+    function sendReliable(bodyStr, useBeacon) {
+        const blob = new Blob([bodyStr], { type: 'text/plain' });
+
+        if (useBeacon) {
+            // Beacon is the safest option when the page is about to navigate.
+            const ok = navigator.sendBeacon(ENDPOINT_URL, blob);
+            if (ok) return Promise.resolve();
+            // Beacon quota exceeded — fall through to sync XHR.
+        }
+
+        // keepalive fetch for normal in-page sends.
+        const p = fetch(ENDPOINT_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'text/plain' },
+            body: bodyStr,
+            keepalive: true
+        }).catch(() => null);
+
+        if (!useBeacon) return p;
+
+        // If we reach here, sendBeacon returned false (quota hit).
+        // Use sync XHR as an absolute last resort.
+        try {
+            const xhr = new XMLHttpRequest();
+            xhr.open('POST', ENDPOINT_URL, false); // false = synchronous
+            xhr.setRequestHeader('Content-Type', 'text/plain');
+            xhr.send(bodyStr);
+        } catch (e) {}
+        return Promise.resolve();
+    }
+
+    function sendEventPayload(payload, useBeacon) {
+        const eventId   = payload._eventId;
+        const sendBody  = Object.assign({}, payload);
+        delete sendBody._eventId;
+        return sendReliable(JSON.stringify(sendBody), useBeacon).then(() => {
+            if (eventId) dequeueEvent(eventId);
+        });
+    }
+
+    function flushQueue(useBeacon) {
+        getQueue().forEach(payload => sendEventPayload(payload, useBeacon));
+    }
+
+    // ─── Core send ────────────────────────────────────────────────────────────
+    function sendEvent(eventType, contextUrl, useBeacon) {
+        const url     = contextUrl || window.location.href;
+        const payload = {
+            Timestamp:    new Date().toISOString(),
+            Workspace_ID: workspaceId,
+            Session_ID:   getSessionId(),
+            Event_Type:   eventType,
+            Page_URL:     url,
+            UTM_Source:   getUtmSource(),
+            Page_Type:    getPageType(url),
+            Job_ID:       getJobId(url)
+        };
+        enqueueEvent(payload);
+        return sendEventPayload(payload, useBeacon);
+    }
+
+    // ─── Heuristics ───────────────────────────────────────────────────────────
     function isAtsLink(url) {
         if (!url) return false;
         try {
-            const urlObj = new URL(url, window.location.origin);
-            const hostname = urlObj.hostname.toLowerCase();
-            return atsDomains.some(domain => hostname.includes(domain.toLowerCase()));
-        } catch (e) {
-            return false;
-        }
+            const h = new URL(url, window.location.origin).hostname.toLowerCase();
+            return atsDomains.some(d => h.includes(d.toLowerCase()));
+        } catch (e) { return false; }
     }
 
-    function isApplyButton(element) {
-        const text = (element.innerText || element.value || element.getAttribute('aria-label') || '').toLowerCase();
-        return applyKeywords.some(keyword => text.includes(keyword));
+    function isApplyButton(el) {
+        const text = (el.innerText || el.value || el.getAttribute('aria-label') || '').toLowerCase();
+        return applyKeywords.some(kw => text.includes(kw));
     }
 
-    function isJobDetailLink(url, element) {
+    function isJobDetailLink(url, el) {
         if (!url) return false;
-
-        // 1. Euristica forte basata sulla GTM config
-        if (jobOfferUrl && extractJobId(url, jobOfferUrl) !== null) {
-            return true;
-        }
-
-        // 2. Fallback su keyword nel path e nel testo
+        if (jobOfferUrl && extractJobId(url, jobOfferUrl) !== null) return true;
         const urlLower = url.toLowerCase();
-        const hasJobPath = urlLower.includes('/job/') || urlLower.includes('/offerta/') || urlLower.includes('/career/') || urlLower.includes('/position/');
-
-        const text = (element.innerText || '').toLowerCase();
-        const isJobRelatedText = text.includes('scopri') || text.includes('dettagli') || text.includes('view') || text.includes('details');
-
-        return hasJobPath || isJobRelatedText;
+        const hasJobPath = urlLower.includes('/job/') || urlLower.includes('/offerta/') ||
+                           urlLower.includes('/career/') || urlLower.includes('/position/');
+        const text = (el.innerText || '').toLowerCase();
+        const isJobText = text.includes('scopri') || text.includes('dettagli') ||
+                          text.includes('view') || text.includes('details');
+        return hasJobPath || isJobText;
     }
 
-    /**
-     * Event Delegation
-     */
+    // ─── Deduplication state ──────────────────────────────────────────────────
+    var lastJobClickUrl  = null;
+    var lastJobClickTime = 0;
+    var lastPageViewUrl  = null;
+
+    function dedupeJobClick(url) {
+        if (url === lastJobClickUrl && (Date.now() - lastJobClickTime) < 2000) return false;
+        lastJobClickUrl  = url;
+        lastJobClickTime = Date.now();
+        return true;
+    }
+
+    // ─── Layer 1: Click delegation ────────────────────────────────────────────
+    // Fires BEFORE the browser navigates — the page is still fully alive.
+    // This is the most reliable layer for BOTH job_click and outbound_ats_click.
     function setupEventDelegation() {
         document.addEventListener('click', function (e) {
-            // Ampliamo la ricerca: framework SPA come Bubble.io usano div o span.
-            // Cerchiamo a, button etc., ma se non lo troviamo analizziamo direttamente l'e.target
             const target = e.target.closest('a, button, input[type="button"], input[type="submit"]') || e.target;
             if (!target) return;
 
-            // Usa target.href per i tag <a> per ottenere l'URL *assoluto* e non relativo.
             let url = target.href || target.getAttribute('href') || target.getAttribute('data-link');
             if (!url && target.tagName && target.tagName.toLowerCase() !== 'a') {
                 const innerA = target.querySelector('a');
                 if (innerA) url = innerA.href;
             }
 
-            // Determina il tipo di evento
             let eventType = null;
 
             if (isAtsLink(url)) {
+                // *** FIX: outbound is tracked here, in the click handler,
+                //     where the page is guaranteed alive.
+                //     useBeacon=true because the page is about to navigate away.
                 eventType = 'outbound_ats_click';
             } else if (isApplyButton(target)) {
                 eventType = 'apply_click';
@@ -318,138 +268,168 @@
 
             if (!eventType) return;
 
-            // Invio tracciamento. Grazie a keepalive e localStorage queue, 
-            // l'evento sopravviverà all'imminente unload/navigation.
-            // Rimuoviamo preventDefault() che rompe l'esperienza utente e le Single Page Application.
-            
             if (eventType === 'job_click') {
-                let targetUrl = url || window.location.href;
-                if (targetUrl === lastJobClickUrl && (Date.now() - lastJobClickTime) < 2000) return;
-                lastJobClickUrl = targetUrl;
-                lastJobClickTime = Date.now();
+                const targetUrl = url || window.location.href;
+                if (!dedupeJobClick(targetUrl)) return;
             }
 
-            sendEvent(eventType, url);
-        }, true); // true per la Capture Phase (cattura prima dei framework che bloccano la propagazione)
+            // useBeacon=true for outbound (page navigates away immediately).
+            // keepalive fetch is fine for job_click in SPAs (no full unload).
+            const useBeacon = (eventType === 'outbound_ats_click');
+            sendEvent(eventType, url, useBeacon);
+        }, true); // capture phase
     }
 
-    /**
-     * Navigation Interception (Navigation API)
-     * Intercetta TUTTE le navigazioni (incluso window.location.href = ...)
-     * PRIMA che avvengano. Disponibile in Chrome/Edge 102+.
-     * Usa sendBeacon con text/plain per inviare l'evento prima che la pagina muoia.
-     */
-    function setupNavigationInterception() {
-        if (!window.navigation) return;
+    // ─── Layer 2: SPA routing monitor ────────────────────────────────────────
+    // Patches history.pushState / replaceState so we can observe every
+    // client-side URL change regardless of the SPA framework used.
+    function setupSpaMonitor() {
+        var previousUrl = window.location.href;
 
-        navigation.addEventListener('navigate', function (event) {
-            var destinationUrl = event.destination.url;
-            if (!destinationUrl) return;
+        function onVirtualNavigation(newUrl) {
+            if (newUrl === previousUrl) return;
+            const prevUrl = previousUrl;
+            previousUrl   = newUrl;
 
-            var eventType = null;
+            // Fire page_view for the new virtual page (debounced to avoid double-fire
+            // when pushState fires right before popstate).
+            setTimeout(function () {
+                if (window.location.href !== newUrl) return; // already changed again
+                parseUtms(); // pick up any new UTM params in the new URL
 
-            // Controllo outbound ATS
-            if (isAtsLink(destinationUrl)) {
-                eventType = 'outbound_ats_click';
-            }
-            // Controllo navigazione verso job_detail
-            else if (getPageType(destinationUrl) === 'job_detail') {
-                // Evita duplicati
-                if (destinationUrl !== lastJobClickUrl || Date.now() - lastJobClickTime > 2000) {
-                    lastJobClickUrl = destinationUrl;
-                    lastJobClickTime = Date.now();
-                    eventType = 'job_click';
+                // Retrospective job_click: did we just land on a job_detail?
+                if (getPageType(newUrl) === 'job_detail' && getPageType(prevUrl) !== 'job_detail') {
+                    if (dedupeJobClick(newUrl)) {
+                        sendEvent('job_click', newUrl, false);
+                    }
                 }
-            }
 
-            if (!eventType) return;
+                // Debounce page_view — only if URL actually differs
+                if (newUrl !== lastPageViewUrl) {
+                    lastPageViewUrl = newUrl;
+                    sendEvent('page_view', newUrl, false);
+                }
+            }, 0);
+        }
 
-            var payload = {
-                Timestamp: new Date().toISOString(),
-                Workspace_ID: workspaceId,
-                Session_ID: getSessionId(),
-                Event_Type: eventType,
-                Page_URL: destinationUrl,
-                UTM_Source: getUtmSource(),
-                Page_Type: getPageType(destinationUrl),
-                Job_ID: getJobId(destinationUrl)
-            };
+        // Patch pushState
+        var originalPush = history.pushState.bind(history);
+        history.pushState = function (state, title, url) {
+            originalPush(state, title, url);
+            onVirtualNavigation(window.location.href);
+        };
 
-            // sendBeacon con text/plain bypassa il CORS preflight.
-            // Il Worker già gestisce payload text/plain (request.text() + JSON.parse).
-            var blob = new Blob([JSON.stringify(payload)], { type: 'text/plain' });
-            navigator.sendBeacon(ENDPOINT_URL, blob);
+        // Patch replaceState
+        var originalReplace = history.replaceState.bind(history);
+        history.replaceState = function (state, title, url) {
+            originalReplace(state, title, url);
+            onVirtualNavigation(window.location.href);
+        };
+
+        // Handle browser back/forward
+        window.addEventListener('popstate', function () {
+            onVirtualNavigation(window.location.href);
+        });
+
+        // Hash-only SPAs
+        window.addEventListener('hashchange', function () {
+            onVirtualNavigation(window.location.href);
         });
     }
 
-    /**
-     * Outbound Interception (Fallback)
-     * Per browser senza Navigation API: intercetta window.open()
-     * e prova a wrappare location.assign/replace.
-     */
+    // ─── Layer 3: window.open fallback ────────────────────────────────────────
     function setupOutboundFallback() {
-        // Intercetta window.open (per link che aprono in nuova tab)
         var originalOpen = window.open;
         window.open = function (url) {
             if (url && isAtsLink(url.toString())) {
-                var payload = {
-                    Timestamp: new Date().toISOString(),
-                    Workspace_ID: workspaceId,
-                    Session_ID: getSessionId(),
-                    Event_Type: 'outbound_ats_click',
-                    Page_URL: url.toString(),
-                    UTM_Source: getUtmSource(),
-                    Page_Type: getPageType(),
-                    Job_ID: getJobId()
-                };
-                var blob = new Blob([JSON.stringify(payload)], { type: 'text/plain' });
-                navigator.sendBeacon(ENDPOINT_URL, blob);
+                // New tab: page stays alive, so keepalive fetch is fine.
+                sendEvent('outbound_ats_click', url.toString(), false);
             }
             return originalOpen.apply(this, arguments);
         };
     }
 
-    /**
-     * Init logic
-     */
+    // ─── Layer 4: Navigation API (same-origin only, Chrome 102+) ─────────────
+    // Kept for completeness — mainly useful for Bubble.io / location.href=
+    // navigations to same-origin job_detail pages.
+    // Cross-origin outbound is intentionally NOT handled here (see Layer 1).
+    function setupNavigationInterception() {
+        if (!window.navigation) return;
+        navigation.addEventListener('navigate', function (event) {
+            var destUrl = event.destination.url;
+            if (!destUrl) return;
+
+            // Only handle same-origin navigations (cross-origin won't fire here anyway).
+            try { if (new URL(destUrl).origin !== window.location.origin) return; }
+            catch (e) { return; }
+
+            if (getPageType(destUrl) === 'job_detail') {
+                if (dedupeJobClick(destUrl)) {
+                    var payload = {
+                        Timestamp:    new Date().toISOString(),
+                        Workspace_ID: workspaceId,
+                        Session_ID:   getSessionId(),
+                        Event_Type:   'job_click',
+                        Page_URL:     destUrl,
+                        UTM_Source:   getUtmSource(),
+                        Page_Type:    getPageType(destUrl),
+                        Job_ID:       getJobId(destUrl)
+                    };
+                    // useBeacon=true: page is about to navigate.
+                    var blob = new Blob([JSON.stringify(payload)], { type: 'text/plain' });
+                    navigator.sendBeacon(ENDPOINT_URL, blob);
+                }
+            }
+        });
+    }
+
+    // ─── Page lifecycle: flush on unload ─────────────────────────────────────
+    function setupLifecycleFlush() {
+        // pagehide is fired reliably on mobile Safari and Chromium for BFcache.
+        window.addEventListener('pagehide', function () {
+            flushQueue(true); // useBeacon=true: page is dying
+        });
+
+        // visibilitychange catches tab switching and aggressive discard.
+        document.addEventListener('visibilitychange', function () {
+            if (document.visibilityState === 'hidden') {
+                flushQueue(true);
+            }
+        });
+    }
+
+    // ─── Init ─────────────────────────────────────────────────────────────────
     function init() {
         parseUtms();
-        
-        // Svuota eventuali eventi rimasti in coda (es. job_click da pagina precedente)
-        flushQueue();
+        flushQueue(false); // flush any events left from the previous page
 
-        // Retrospective job_click detection:
-        // Se il pixel si carica su una pagina job_detail e il referrer
-        // è dello stesso sito, significa che l'utente ha cliccato su un'offerta.
-        // Questo funziona universalmente indipendentemente dal framework.
+        // Retrospective job_click on hard navigation (same-origin referrer → job_detail).
+        // This covers traditional MPA navigation where the pixel loads fresh.
         var currentPageType = getPageType();
         if (currentPageType === 'job_detail') {
             try {
                 var referrer = document.referrer;
                 if (referrer && new URL(referrer).origin === window.location.origin) {
-                    sendEvent('job_click');
+                    if (dedupeJobClick(window.location.href)) {
+                        sendEvent('job_click', window.location.href, false);
+                    }
                 }
-            } catch (e) { }
+            } catch (e) {}
         }
 
-        // Traccia la page_view al caricamento
+        lastPageViewUrl = window.location.href;
         sendEvent('page_view');
 
-        // Layer 1: Click handler con preventDefault (per siti con <a> tags)
-        setupEventDelegation();
-
-        // Layer 2: Navigation API (per Bubble.io e framework con location.href)
-        setupNavigationInterception();
-
-        // Layer 3: Fallback window.open per browser senza Navigation API
-        setupOutboundFallback();
+        setupEventDelegation();      // Layer 1: click handler (most reliable)
+        setupSpaMonitor();           // Layer 2: SPA route patching (*** key fix)
+        setupOutboundFallback();     // Layer 3: window.open intercept
+        setupNavigationInterception(); // Layer 4: Navigation API (bonus)
+        setupLifecycleFlush();       // Flush queue on pagehide / hidden
     }
 
-    // Esegui quando il DOM è pronto
     if (document.readyState === 'loading') {
         document.addEventListener('DOMContentLoaded', init);
     } else {
         init();
     }
-
 })();

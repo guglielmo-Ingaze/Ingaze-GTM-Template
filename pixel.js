@@ -192,7 +192,7 @@
     function saveQueue(queue) {
         try {
             localStorage.setItem(QUEUE_KEY, JSON.stringify(queue));
-        } catch (e) {}
+        } catch (e) { }
     }
 
     function enqueueEvent(payload) {
@@ -234,7 +234,7 @@
         });
     }
 
-    function sendEvent(eventType, contextUrl) {
+    function sendEvent(eventType, contextUrl, overrides) {
         const url = contextUrl || window.location.href;
         const payload = {
             Timestamp: new Date().toISOString(),
@@ -246,6 +246,12 @@
             Page_Type: getPageType(url),
             Job_ID: getJobId(url)
         };
+
+        // Add Target_Page_Type and Target_Page_Url for outbound_ats_click events
+        if (eventType === 'outbound_ats_click' && overrides) {
+            if (overrides.Target_Page_Type) payload.Target_Page_Type = overrides.Target_Page_Type;
+            if (overrides.Target_Page_Url) payload.Target_Page_Url = overrides.Target_Page_Url;
+        }
 
         enqueueEvent(payload);
         return sendEventPayload(payload);
@@ -283,13 +289,16 @@
                 return originalUrl;
             }
             const encoded = encodeURIComponent(urlObj.href);
+            const targetPageType = getPageType(urlObj.href);
             return `${ENDPOINT_URL.replace(/\/$/, '')}/out` +
                 `?to=${encoded}` +
                 `&wid=${workspaceId}` +
                 `&sid=${getSessionId()}` +
                 `&jid=${getJobId(urlObj.href) || ''}` +
-                `&utm=${encodeURIComponent(getUtmSource() || '')}`;
-        } catch(e) {
+                `&utm=${encodeURIComponent(getUtmSource() || '')}` +
+                `&tpt=${encodeURIComponent(targetPageType)}` +
+                `&tpu=${encoded}`;
+        } catch (e) {
             return originalUrl;
         }
     }
@@ -370,8 +379,17 @@
                 lastJobClickTime = Date.now();
             }
 
+            // Build overrides for outbound_ats_click
+            var eventOverrides = null;
+            if (eventType === 'outbound_ats_click' && url) {
+                eventOverrides = {
+                    Target_Page_Url: url,
+                    Target_Page_Type: getPageType(url)
+                };
+            }
+
             // Invio tramite coda / keepalive
-            sendEvent(eventType, url || window.location.href);
+            sendEvent(eventType, url || window.location.href, eventOverrides);
         }
 
         document.addEventListener('pointerdown', handleIntent, { capture: true });
@@ -409,13 +427,13 @@
         }
 
         const originalPushState = history.pushState;
-        history.pushState = function() {
+        history.pushState = function () {
             originalPushState.apply(this, arguments);
             handleUrlChange();
         };
 
         const originalReplaceState = history.replaceState;
-        history.replaceState = function() {
+        history.replaceState = function () {
             originalReplaceState.apply(this, arguments);
             handleUrlChange();
         };
@@ -436,41 +454,41 @@
                     if (normalized && isAtsLink(normalized)) {
                         this.href = buildRedirectUrl(normalized);
                     }
-                } catch (e) {}
+                } catch (e) { }
                 return originalClick.apply(this, arguments);
             };
-        } catch (e) {}
+        } catch (e) { }
 
         // Layer 3: Intercept location.assign
         try {
             const originalAssign = window.location.assign;
-            window.location.assign = function(url) {
+            window.location.assign = function (url) {
                 const normalized = normalizeUrl(url);
                 if (normalized && isAtsLink(normalized)) {
                     url = buildRedirectUrl(normalized);
                 }
                 return originalAssign.call(this, url);
             };
-        } catch (e) {}
+        } catch (e) { }
 
         // Layer 3: Intercept location.replace
         try {
             const originalReplace = window.location.replace;
-            window.location.replace = function(url) {
+            window.location.replace = function (url) {
                 const normalized = normalizeUrl(url);
                 if (normalized && isAtsLink(normalized)) {
                     url = buildRedirectUrl(normalized);
                 }
                 return originalReplace.call(this, url);
             };
-        } catch (e) {}
+        } catch (e) { }
 
         // Layer 3: Best effort intercept location.href assignment
         try {
             const originalLocation = window.location;
             const originalAssign = window.location.assign;
             Object.defineProperty(window.location, 'href', {
-                set: function(url) {
+                set: function (url) {
                     const normalized = normalizeUrl(url);
                     if (normalized && isAtsLink(normalized)) {
                         url = buildRedirectUrl(normalized);
@@ -478,7 +496,7 @@
                     return originalAssign.call(originalLocation, url);
                 }
             });
-        } catch (e) {}
+        } catch (e) { }
 
         // Layer 3: Intercept window.open
         try {
@@ -490,7 +508,7 @@
                 }
                 return originalOpen.call(this, url, target, features);
             };
-        } catch(e) {}
+        } catch (e) { }
     }
 
     /**
@@ -508,7 +526,7 @@
 
     function rewriteOutboundLinks() {
         const links = document.querySelectorAll('a[href]');
-        
+
         links.forEach(link => {
             try {
                 const normalized = normalizeUrl(link.href);
@@ -516,7 +534,7 @@
                     link.href = buildRedirectUrl(normalized);
                     link.rel = "noopener noreferrer";
                 }
-            } catch (e) {}
+            } catch (e) { }
         });
     }
 
@@ -533,7 +551,7 @@
         });
 
         // Client-side dedupe for rewritten links
-        document.addEventListener('click', function(e) {
+        document.addEventListener('click', function (e) {
             const target = e.target.closest('a');
             if (target && target.href && target.href.includes('/out?to=')) {
                 if (isDuplicateClick(target.href)) {
@@ -548,7 +566,7 @@
      */
     function init() {
         parseUtms();
-        
+
         // Svuota eventuali eventi rimasti in coda (es. job_click da pagina precedente)
         flushQueue();
 

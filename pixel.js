@@ -191,13 +191,13 @@ export default {
       // Note: In Bubble, field names should match exactly what's configured in the Data Type (often lowercase without spaces).
       const bubblePayload = {
         workspace_id: Workspace_ID,
-        event_type: Event_Type,
-        session_id: Session_ID,
-        page_url: Page_URL,
-        utm_source: UTM_Source,
-        page_type: Page_Type || null,
-        job_id: Job_ID || null,
-        timestamp_string: Timestamp || new Date().toISOString()
+        Event_Type: Event_Type,
+        Session_ID: Session_ID,
+        Page_URL: Page_URL,
+        UTM_Source: UTM_Source,
+        Page_Type: Page_Type || null,
+        Job_ID: Job_ID || null,
+        Timestamp: Timestamp || new Date().toISOString()
       };
 
       const bubbleResponse = await fetch('https://app.ingaze.ai/version-test/api/1.1/obj/cwc_events', {
@@ -252,10 +252,10 @@ async function handleOutbound(request, env, ctx) {
   // --- Deduplication (Server-side via Cache API) ---
   const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
   const ua = request.headers.get('User-Agent') || 'unknown';
-  
+
   // Finestra di 5 secondi per la deduplicazione
-  const dedupeKey = await hash(`${ip}|${ua}|${decodedTo}|${jid}|${Math.floor(Date.now()/5000)}`);
-  
+  const dedupeKey = await hash(`${ip}|${ua}|${decodedTo}|${jid}|${Math.floor(Date.now() / 5000)}`);
+
   // Usiamo Cache API per deduplicazione (free & fast)
   const cache = caches.default;
   const cacheUrl = new URL(`https://dedupe.internal/${dedupeKey}`);
@@ -273,24 +273,24 @@ async function handleOutbound(request, env, ctx) {
     const timestamp = new Date().toISOString();
 
     const bubblePayload = {
-        workspace_id: wid,
-        event_type: 'outbound_ats_click',
-        session_id: sid,
-        page_url: decodedTo,
-        utm_source: utm,
-        page_type: null,
-        job_id: jid || null,
-        timestamp_string: timestamp
+      workspace_id: wid,
+      event_type: 'outbound_ats_click',
+      session_id: sid,
+      page_url: decodedTo,
+      utm_source: utm,
+      page_type: null,
+      job_id: jid || null,
+      timestamp_string: timestamp
     };
 
     // Fire and forget event to Bubble.io
     const sendEvent = async () => {
       try {
         if (env.Workspace_id_binding && wid) {
-            const allowedOriginsStr = await env.Workspace_id_binding.get(wid);
-            if (!allowedOriginsStr) return; // Invalid workspace
+          const allowedOriginsStr = await env.Workspace_id_binding.get(wid);
+          if (!allowedOriginsStr) return; // Invalid workspace
         }
-        
+
         const bubbleResponse = await fetch('https://app.ingaze.ai/version-test/api/1.1/obj/cwc_events', {
           method: 'POST',
           headers: {
@@ -304,7 +304,7 @@ async function handleOutbound(request, env, ctx) {
         console.error('Fetch Error:', e);
       }
     };
-    
+
     ctx.waitUntil(sendEvent());
   }
 

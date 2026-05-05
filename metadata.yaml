@@ -1,0 +1,5 @@
+homepage: "https://www.ingaze.com"
+documentation: "https://github.com/ingaze/gtm-template/blob/main/README.md"
+versions:
+  - sha: 0000000000000000000000000000000000000000
+    changeNotes: Initial release.

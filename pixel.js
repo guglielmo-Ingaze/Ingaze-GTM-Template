@@ -258,10 +258,39 @@
         if (!url) return false;
         try {
             const urlObj = new URL(url, window.location.origin);
+            // Non consideriamo link ATS quelli che sono già stati riscritti per il worker
+            if (urlObj.pathname.startsWith('/out') && urlObj.searchParams.has('to')) return false;
+
             const hostname = urlObj.hostname.toLowerCase();
             return atsDomains.some(domain => hostname.includes(domain.toLowerCase()));
         } catch (e) {
             return false;
+        }
+    }
+
+    function normalizeUrl(url) {
+        try {
+            return new URL(url, window.location.href).href;
+        } catch (e) {
+            return null;
+        }
+    }
+
+    function buildRedirectUrl(originalUrl) {
+        try {
+            const urlObj = new URL(originalUrl, window.location.origin);
+            if (urlObj.pathname.startsWith('/out') && urlObj.searchParams.has('to')) {
+                return originalUrl;
+            }
+            const encoded = encodeURIComponent(urlObj.href);
+            return `${ENDPOINT_URL.replace(/\/$/, '')}/out` +
+                `?to=${encoded}` +
+                `&wid=${workspaceId}` +
+                `&sid=${getSessionId()}` +
+                `&jid=${getJobId(urlObj.href) || ''}` +
+                `&utm=${encodeURIComponent(getUtmSource() || '')}`;
+        } catch(e) {
+            return originalUrl;
         }
     }
 
@@ -345,8 +374,8 @@
             sendEvent(eventType, url || window.location.href);
         }
 
-        document.addEventListener('pointerdown', handleIntent, { capture: true, passive: true });
-        document.addEventListener('auxclick', handleIntent, { capture: true, passive: true });
+        document.addEventListener('pointerdown', handleIntent, { capture: true });
+        document.addEventListener('auxclick', handleIntent, { capture: true });
         document.addEventListener('keydown', function (e) {
             if (e.key === 'Enter' || e.key === ' ') handleIntent(e);
         }, true);
@@ -395,17 +424,73 @@
     }
 
     /**
-     * Outbound Interception (Fallback)
-     * Intercetta window.open() per link che non sono <a> tags.
+     * Layer 2.5 & 3: Intercept Navigation APIs & programmatic clicks
      */
-    function setupOutboundFallback() {
-        var originalOpen = window.open;
-        window.open = function (url) {
-            if (url && isAtsLink(url.toString())) {
-                sendEvent('outbound_ats_click', url.toString());
-            }
-            return originalOpen.apply(this, arguments);
-        };
+    function setupNavigationInterceptors() {
+        // Layer 2: Intercept HTMLAnchorElement.click()
+        try {
+            const originalClick = HTMLAnchorElement.prototype.click;
+            HTMLAnchorElement.prototype.click = function () {
+                try {
+                    const normalized = normalizeUrl(this.href);
+                    if (normalized && isAtsLink(normalized)) {
+                        this.href = buildRedirectUrl(normalized);
+                    }
+                } catch (e) {}
+                return originalClick.apply(this, arguments);
+            };
+        } catch (e) {}
+
+        // Layer 3: Intercept location.assign
+        try {
+            const originalAssign = window.location.assign;
+            window.location.assign = function(url) {
+                const normalized = normalizeUrl(url);
+                if (normalized && isAtsLink(normalized)) {
+                    url = buildRedirectUrl(normalized);
+                }
+                return originalAssign.call(this, url);
+            };
+        } catch (e) {}
+
+        // Layer 3: Intercept location.replace
+        try {
+            const originalReplace = window.location.replace;
+            window.location.replace = function(url) {
+                const normalized = normalizeUrl(url);
+                if (normalized && isAtsLink(normalized)) {
+                    url = buildRedirectUrl(normalized);
+                }
+                return originalReplace.call(this, url);
+            };
+        } catch (e) {}
+
+        // Layer 3: Best effort intercept location.href assignment
+        try {
+            const originalLocation = window.location;
+            const originalAssign = window.location.assign;
+            Object.defineProperty(window.location, 'href', {
+                set: function(url) {
+                    const normalized = normalizeUrl(url);
+                    if (normalized && isAtsLink(normalized)) {
+                        url = buildRedirectUrl(normalized);
+                    }
+                    return originalAssign.call(originalLocation, url);
+                }
+            });
+        } catch (e) {}
+
+        // Layer 3: Intercept window.open
+        try {
+            var originalOpen = window.open;
+            window.open = function (url, target, features) {
+                const normalized = normalizeUrl(url);
+                if (normalized && isAtsLink(normalized)) {
+                    url = buildRedirectUrl(normalized);
+                }
+                return originalOpen.call(this, url, target, features);
+            };
+        } catch(e) {}
     }
 
     /**
@@ -426,24 +511,11 @@
         
         links.forEach(link => {
             try {
-                const urlObj = new URL(link.href, window.location.origin);
-
-                if (!isAtsLink(urlObj.href)) return;
-
-                // Avoid double-wrapping
-                if (urlObj.pathname.startsWith('/out')) return;
-
-                const encoded = encodeURIComponent(urlObj.href);
-
-                const newUrl = `${ENDPOINT_URL.replace(/\/$/, '')}/out` +
-                    `?to=${encoded}` +
-                    `&wid=${workspaceId}` +
-                    `&sid=${getSessionId()}` +
-                    `&jid=${getJobId(urlObj.href) || ''}` +
-                    `&utm=${encodeURIComponent(getUtmSource() || '')}`;
-
-                link.href = newUrl;
-                link.rel = "noopener noreferrer";
+                const normalized = normalizeUrl(link.href);
+                if (normalized && isAtsLink(normalized)) {
+                    link.href = buildRedirectUrl(normalized);
+                    link.rel = "noopener noreferrer";
+                }
             } catch (e) {}
         });
     }
@@ -503,8 +575,8 @@
         // Layer 2: SPA Route monitoring per inferred job_clicks
         setupSpaRouting();
 
-        // Layer 3: Fallback window.open per browser outbound generici
-        setupOutboundFallback();
+        // Layer 2.5 & 3: Navigation API Interception
+        setupNavigationInterceptors();
 
         // Layer 4: Redirect-based outbound tracking per <a> tags
         setupOutboundRewriting();

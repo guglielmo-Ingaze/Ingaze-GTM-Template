@@ -177,6 +177,63 @@
     // Deduplicazione: evita doppio job_click da click handler + SPA monitor
     var lastJobClickUrl = null;
     var lastJobClickTime = 0;
+
+    // Queue implementation per garantire l'invio durante la navigazione
+    const QUEUE_KEY = 'ingaze_event_queue';
+
+    function getQueue() {
+        try {
+            return JSON.parse(localStorage.getItem(QUEUE_KEY)) || [];
+        } catch (e) {
+            return [];
+        }
+    }
+
+    function saveQueue(queue) {
+        try {
+            localStorage.setItem(QUEUE_KEY, JSON.stringify(queue));
+        } catch (e) {}
+    }
+
+    function enqueueEvent(payload) {
+        payload._eventId = Date.now().toString(36) + Math.random().toString(36).substr(2);
+        const queue = getQueue();
+        queue.push(payload);
+        saveQueue(queue);
+        return payload._eventId;
+    }
+
+    function dequeueEvent(eventId) {
+        const queue = getQueue();
+        const newQueue = queue.filter(item => item._eventId !== eventId);
+        saveQueue(newQueue);
+    }
+
+    function sendEventPayload(payload) {
+        const eventId = payload._eventId;
+        const sendPayload = Object.assign({}, payload);
+        delete sendPayload._eventId;
+
+        return fetch(ENDPOINT_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'text/plain' }, // Usa text/plain per evitare preflight CORS
+            body: JSON.stringify(sendPayload),
+            keepalive: true // Garantisce l'invio anche se la pagina viene chiusa/navigata
+        }).then(res => {
+            if (eventId) dequeueEvent(eventId);
+            return res;
+        }).catch(err => {
+            console.warn('[Ingaze] Errore invio evento:', err);
+        });
+    }
+
+    function flushQueue() {
+        const queue = getQueue();
+        queue.forEach(payload => {
+            sendEventPayload(payload);
+        });
+    }
+
     function sendEvent(eventType, contextUrl) {
         const url = contextUrl || window.location.href;
         const payload = {
@@ -190,11 +247,8 @@
             Job_ID: getJobId(url)
         };
 
-        return fetch(ENDPOINT_URL, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload)
-        }).catch(err => console.warn('[Ingaze] Errore invio evento:', err));
+        enqueueEvent(payload);
+        return sendEventPayload(payload);
     }
 
     /**
@@ -239,70 +293,44 @@
      */
     function setupEventDelegation() {
         document.addEventListener('click', function (e) {
-            // Trova l'elemento <a> o <button> più vicino al click
-            const target = e.target.closest('a, button, input[type="button"], input[type="submit"]');
+            // Ampliamo la ricerca: framework SPA come Bubble.io usano div o span.
+            // Cerchiamo a, button etc., ma se non lo troviamo analizziamo direttamente l'e.target
+            const target = e.target.closest('a, button, input[type="button"], input[type="submit"]') || e.target;
             if (!target) return;
 
             // Usa target.href per i tag <a> per ottenere l'URL *assoluto* e non relativo.
             let url = target.href || target.getAttribute('href') || target.getAttribute('data-link');
-            if (!url && target.tagName.toLowerCase() !== 'a') {
+            if (!url && target.tagName && target.tagName.toLowerCase() !== 'a') {
                 const innerA = target.querySelector('a');
                 if (innerA) url = innerA.href;
             }
 
-            // Determina il tipo di evento e se causa navigazione
+            // Determina il tipo di evento
             let eventType = null;
-            let navigatesAway = false;
 
             if (isAtsLink(url)) {
                 eventType = 'outbound_ats_click';
-                navigatesAway = true;
             } else if (isApplyButton(target)) {
                 eventType = 'apply_click';
-            } else if (target.tagName.toLowerCase() === 'a' && isJobDetailLink(url, target)) {
+            } else if (isJobDetailLink(url, target)) {
                 eventType = 'job_click';
-                navigatesAway = true;
             }
 
             if (!eventType) return;
 
-            // Per i click che causano navigazione (job_click, outbound_ats_click):
-            // Blocchiamo la navigazione del browser, inviamo l'evento di tracking,
-            // poi navighiamo programmaticamente. Questo è l'approccio standard
-            // usato da Google Analytics, Facebook Pixel, ecc.
-            // I link che aprono in nuova tab (_blank) non hanno questo problema
-            // perché la pagina corrente non viene scaricata.
-            const opensInNewTab = target.target === '_blank';
-
-            if (navigatesAway && url && !opensInNewTab) {
-                e.preventDefault();
-
-                let hasNavigated = false;
-                const doNavigate = function () {
-                    if (hasNavigated) return;
-                    hasNavigated = true;
-                    window.location.href = url;
-                };
-
-                // Invia l'evento con l'URL di destinazione come contesto,
-                // poi naviga (sia in caso di successo che di errore).
-                if (eventType === 'job_click') {
-                    lastJobClickUrl = url;
-                    lastJobClickTime = Date.now();
-                }
-                sendEvent(eventType, url)
-                    .then(doNavigate)
-                    .catch(doNavigate);
-
-                // Timeout di sicurezza: non bloccare mai la navigazione
-                // per più di 300ms, anche se l'endpoint è lento.
-                setTimeout(doNavigate, 300);
-            } else {
-                // Eventi che non causano navigazione (apply_click)
-                // o link che aprono in nuova tab: invio normale.
-                sendEvent(eventType, navigatesAway ? url : undefined);
+            // Invio tracciamento. Grazie a keepalive e localStorage queue, 
+            // l'evento sopravviverà all'imminente unload/navigation.
+            // Rimuoviamo preventDefault() che rompe l'esperienza utente e le Single Page Application.
+            
+            if (eventType === 'job_click') {
+                let targetUrl = url || window.location.href;
+                if (targetUrl === lastJobClickUrl && (Date.now() - lastJobClickTime) < 2000) return;
+                lastJobClickUrl = targetUrl;
+                lastJobClickTime = Date.now();
             }
-        });
+
+            sendEvent(eventType, url);
+        }, true); // true per la Capture Phase (cattura prima dei framework che bloccano la propagazione)
     }
 
     /**
@@ -386,6 +414,9 @@
      */
     function init() {
         parseUtms();
+        
+        // Svuota eventuali eventi rimasti in coda (es. job_click da pagina precedente)
+        flushQueue();
 
         // Retrospective job_click detection:
         // Se il pixel si carica su una pagina job_detail e il referrer

@@ -153,14 +153,23 @@
         const currentUrlLower = currentUrlFull.toLowerCase();
 
         // 1. Identifica 'job_detail' usando jobOfferUrl
-        if (jobOfferUrl && extractJobId(currentUrlFull, jobOfferUrl) !== null) {
-            return 'job_detail';
+        if (jobOfferUrl) {
+            const baseJobLower = jobOfferUrl.toLowerCase().trim().replace(/\/+$/, '');
+            const currentBaseLower = currentUrlLower.split('?')[0].split('#')[0].replace(/\/+$/, '');
+
+            // FIX: corrisponde sia a URL esatti (es. il bottone punta proprio al jobOfferUrl)
+            // sia a URL che ne sono derivati (es. .../job/software_engineer/12345)
+            if (
+                currentBaseLower === baseJobLower ||              // match esatto
+                currentBaseLower.startsWith(baseJobLower + '/') || // sottopercorso
+                extractJobId(currentUrlFull, jobOfferUrl) !== null // logica originale
+            ) {
+                return 'job_detail';
+            }
         }
 
         // 2. Identifica 'career_home' usando careerSiteUrl
-        // Rimuoviamo query e hash per fare il check pulito della root
         const currentBase = currentUrlLower.split('?')[0].split('#')[0].replace(/\/$/, '');
-
         if (careerSiteUrl) {
             const baseCareer = careerSiteUrl.toLowerCase().trim().split('?')[0].split('#')[0].replace(/\/$/, '');
             if (currentBase === baseCareer) {
